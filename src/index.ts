@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
@@ -24,6 +25,8 @@ import { initDatabase, storeMessage, storeChatMetadata, getNewMessages, getMessa
 import { startSchedulerLoop } from './task-scheduler.js';
 import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot, AvailableGroup } from './container-runner.js';
 import { loadJson, saveJson } from './utils.js';
+import { startWebServer, setMessageCallback, setGetMessagesCallback, broadcastNewMessage, broadcastMessage } from './web-server.js';
+import { initiateOAuth } from './nango-client.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -37,6 +40,36 @@ let lastTimestamp = '';
 let sessions: Session = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
+
+// Web messages storage (in-memory, synced with main group)
+interface WebMessage {
+  id: string;
+  sender: string;
+  sender_name: string;
+  content: string;
+  timestamp: string;
+  source: 'whatsapp' | 'web';
+}
+const webMessages: WebMessage[] = [];
+const MAX_WEB_MESSAGES = 500;
+
+function addWebMessage(msg: WebMessage): void {
+  webMessages.push(msg);
+  if (webMessages.length > MAX_WEB_MESSAGES) {
+    webMessages.shift();
+  }
+}
+
+function getWebMessages(limit = 50, before?: string): WebMessage[] {
+  let messages = webMessages;
+  if (before) {
+    const idx = messages.findIndex(m => m.timestamp >= before);
+    if (idx > 0) {
+      messages = messages.slice(0, idx);
+    }
+  }
+  return messages.slice(-limit).reverse();
+}
 
 async function setTyping(jid: string, isTyping: boolean): Promise<void> {
   try {
@@ -164,6 +197,20 @@ async function processMessage(msg: NewMessage): Promise<void> {
   if (response) {
     lastAgentTimestamp[msg.chat_jid] = msg.timestamp;
     await sendMessage(msg.chat_jid, `${ASSISTANT_NAME}: ${response}`);
+
+    // Broadcast to web clients if this is the main group
+    if (isMainGroup) {
+      const responseMsg: WebMessage = {
+        id: `wa-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        sender: 'assistant',
+        sender_name: ASSISTANT_NAME,
+        content: response,
+        timestamp: new Date().toISOString(),
+        source: 'whatsapp'
+      };
+      addWebMessage(responseMsg);
+      broadcastNewMessage(responseMsg);
+    }
   }
 }
 
@@ -204,6 +251,21 @@ async function runAgent(group: RegisteredGroup, prompt: string, chatJid: string)
     if (output.status === 'error') {
       logger.error({ group: group.name, error: output.error }, 'Container agent error');
       return null;
+    }
+
+    // Handle AUTH_REQUIRED response from skills
+    if (output.result?.startsWith('AUTH_REQUIRED:')) {
+      const parts = output.result.split(':');
+      const provider = parts[1];
+      const scopes = parts[2]?.split(',') || [];
+
+      try {
+        const authUrl = await initiateOAuth(provider, group.folder, scopes);
+        return `需要授权 ${provider}。请点击链接完成授权: ${authUrl}`;
+      } catch (err) {
+        logger.error({ provider, err }, 'Failed to initiate OAuth');
+        return `授权 ${provider} 失败，请稍后重试。`;
+      }
     }
 
     return output.result;
@@ -491,8 +553,10 @@ async function connectWhatsApp(): Promise<void> {
     if (qr) {
       const msg = 'WhatsApp authentication required. Run /setup in Claude Code.';
       logger.error(msg);
+      // On macOS, show notification
       exec(`osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`);
-      setTimeout(() => process.exit(1), 1000);
+      // Don't exit - Web UI can still work without WhatsApp
+      logger.warn('Web UI is available but WhatsApp features are disabled until authenticated');
     }
 
     if (connection === 'close') {
@@ -504,8 +568,7 @@ async function connectWhatsApp(): Promise<void> {
         logger.info('Reconnecting...');
         connectWhatsApp();
       } else {
-        logger.info('Logged out. Run /setup to re-authenticate.');
-        process.exit(0);
+        logger.warn('Logged out. Run /setup to re-authenticate. Web UI still available.');
       }
     } else if (connection === 'open') {
       logger.info('Connected to WhatsApp');
@@ -541,6 +604,32 @@ async function connectWhatsApp(): Promise<void> {
       // Only store full message content for registered groups
       if (registeredGroups[chatJid]) {
         storeMessage(msg, chatJid, msg.key.fromMe || false, msg.pushName || undefined);
+
+        // Broadcast to web clients if this is the main group
+        const group = registeredGroups[chatJid];
+        if (group?.folder === MAIN_GROUP_FOLDER) {
+          const content =
+            msg.message?.conversation ||
+            msg.message?.extendedTextMessage?.text ||
+            msg.message?.imageMessage?.caption ||
+            msg.message?.videoMessage?.caption ||
+            '';
+
+          if (content) {
+            const sender = msg.key.participant || msg.key.remoteJid || '';
+            const senderName = msg.pushName || sender.split('@')[0];
+            const webMsg: WebMessage = {
+              id: msg.key.id || `wa-${Date.now()}`,
+              sender,
+              sender_name: senderName,
+              content,
+              timestamp,
+              source: 'whatsapp'
+            };
+            addWebMessage(webMsg);
+            broadcastNewMessage(webMsg);
+          }
+        }
       }
     }
   });
@@ -575,26 +664,37 @@ async function startMessageLoop(): Promise<void> {
 }
 
 function ensureContainerSystemRunning(): void {
+  // Check for Apple Container (macOS)
   try {
-    execSync('container system status', { stdio: 'pipe' });
-    logger.debug('Apple Container system already running');
-  } catch {
-    logger.info('Starting Apple Container system...');
+    execSync('which container', { stdio: 'pipe' });
     try {
+      execSync('container system status', { stdio: 'pipe' });
+      logger.info('Apple Container system running');
+      return;
+    } catch {
+      logger.info('Starting Apple Container system...');
       execSync('container system start', { stdio: 'pipe', timeout: 30000 });
       logger.info('Apple Container system started');
-    } catch (err) {
-      logger.error({ err }, 'Failed to start Apple Container system');
-      console.error('\n╔════════════════════════════════════════════════════════════════╗');
-      console.error('║  FATAL: Apple Container system failed to start                 ║');
-      console.error('║                                                                ║');
-      console.error('║  Agents cannot run without Apple Container. To fix:           ║');
-      console.error('║  1. Install from: https://github.com/apple/container/releases ║');
-      console.error('║  2. Run: container system start                               ║');
-      console.error('║  3. Restart NanoClaw                                          ║');
-      console.error('╚════════════════════════════════════════════════════════════════╝\n');
-      throw new Error('Apple Container system is required but failed to start');
+      return;
     }
+  } catch {
+    // Apple Container not available, check for Docker
+  }
+
+  // Check for Docker (Linux)
+  try {
+    execSync('docker info', { stdio: 'pipe' });
+    logger.info('Docker daemon running');
+    return;
+  } catch {
+    console.error('\n╔════════════════════════════════════════════════════════════════╗');
+    console.error('║  FATAL: No container runtime available                         ║');
+    console.error('║                                                                ║');
+    console.error('║  Install one of:                                               ║');
+    console.error('║  - Docker: https://docs.docker.com/engine/install/             ║');
+    console.error('║  - Apple Container (macOS): github.com/apple/container         ║');
+    console.error('╚════════════════════════════════════════════════════════════════╝\n');
+    throw new Error('No container runtime available (docker or container)');
   }
 }
 
@@ -603,6 +703,76 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
+
+  // Start web server if configured
+  const webPassword = process.env.WEB_PASSWORD;
+  const webPort = parseInt(process.env.WEB_PORT || '3000', 10);
+  const jwtSecret = process.env.WEB_JWT_SECRET;
+
+  if (webPassword && jwtSecret) {
+    // Set up callbacks for web server
+    setMessageCallback(async (text: string, source: 'web') => {
+      // Web messages go to the main group
+      const mainGroup = Object.entries(registeredGroups).find(
+        ([, g]) => g.folder === MAIN_GROUP_FOLDER
+      );
+
+      if (!mainGroup) {
+        logger.warn('Main group not registered, cannot process web message');
+        return null;
+      }
+
+      const [chatJid, group] = mainGroup;
+
+      // Store the incoming web message
+      const userMsg: WebMessage = {
+        id: `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        sender: 'web-user',
+        sender_name: 'Web User',
+        content: text,
+        timestamp: new Date().toISOString(),
+        source: 'web'
+      };
+      addWebMessage(userMsg);
+
+      // Format as XML like WhatsApp messages
+      const prompt = `<messages>\n<message sender="Web User" time="${userMsg.timestamp}">${text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</message>\n</messages>`;
+
+      // Run agent
+      broadcastMessage({ type: 'typing', data: { isTyping: true } });
+      const response = await runAgent(group, prompt, chatJid);
+      broadcastMessage({ type: 'typing', data: { isTyping: false } });
+
+      if (response) {
+        // Store and broadcast the response
+        const responseMsg: WebMessage = {
+          id: `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          sender: 'assistant',
+          sender_name: ASSISTANT_NAME,
+          content: response,
+          timestamp: new Date().toISOString(),
+          source: 'web'
+        };
+        addWebMessage(responseMsg);
+        broadcastNewMessage(responseMsg);
+      }
+
+      return response;
+    });
+
+    setGetMessagesCallback((limit = 50, before?: string) => {
+      return getWebMessages(limit, before);
+    });
+
+    await startWebServer({
+      port: webPort,
+      password: webPassword,
+      jwtSecret
+    });
+  } else {
+    logger.info('Web server disabled (set WEB_PASSWORD and WEB_JWT_SECRET to enable)');
+  }
+
   await connectWhatsApp();
 }
 

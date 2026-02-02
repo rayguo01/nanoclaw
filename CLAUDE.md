@@ -2,6 +2,12 @@
 
 Personal Claude assistant. See [README.md](README.md) for philosophy and setup. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for architecture decisions.
 
+## 开发规范
+
+- **执行任务前**：先阅读 `docs/summary.md` 了解项目当前状态和版本
+- **文档位置**：所有文档统一写入 `docs/` 目录
+- **任务完成后**：更新 `docs/summary.md`，概述完成的工作并标注版本号
+
 ## Quick Context
 
 Single Node.js process that connects to WhatsApp, routes messages to Claude Agent SDK running in Apple Container (Linux VMs). Each group has isolated filesystem and memory.

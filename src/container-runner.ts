@@ -3,7 +3,7 @@
  * Spawns agent execution in Apple Container and handles IPC
  */
 
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -22,6 +22,23 @@ const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
   transport: { target: 'pino-pretty', options: { colorize: true } }
 });
+
+// Detect container runtime: 'container' (Apple Container on macOS) or 'docker' (Linux)
+function detectContainerRuntime(): string {
+  try {
+    execSync('which container', { stdio: 'ignore' });
+    return 'container';
+  } catch {
+    try {
+      execSync('which docker', { stdio: 'ignore' });
+      return 'docker';
+    } catch {
+      throw new Error('No container runtime found (container or docker)');
+    }
+  }
+}
+
+const CONTAINER_RUNTIME = detectContainerRuntime();
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -143,6 +160,17 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
     }
   }
 
+  // OAuth tokens directory (read-only for all groups)
+  // Allows agents to read tokens for authorized services like Google Calendar
+  const tokensDir = path.join(DATA_DIR, 'tokens');
+  if (fs.existsSync(tokensDir)) {
+    mounts.push({
+      hostPath: tokensDir,
+      containerPath: '/workspace/tokens',
+      readonly: true
+    });
+  }
+
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(
@@ -159,7 +187,7 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
 function buildContainerArgs(mounts: VolumeMount[]): string[] {
   const args: string[] = ['run', '-i', '--rm'];
 
-  // Apple Container: --mount for readonly, -v for read-write
+  // Both Apple Container and Docker support --mount and -v syntax
   for (const mount of mounts) {
     if (mount.readonly) {
       args.push('--mount', `type=bind,source=${mount.hostPath},target=${mount.containerPath},readonly`);
@@ -201,7 +229,7 @@ export async function runContainerAgent(
   fs.mkdirSync(logsDir, { recursive: true });
 
   return new Promise((resolve) => {
-    const container = spawn('container', containerArgs, {
+    const container = spawn(CONTAINER_RUNTIME, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe']
     });
 

@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  nango:
+    image: nangohq/nango-server:latest
+    container_name: nanoclaw-nango
+    restart: unless-stopped
+    ports:
+      - "3003:3003"
+    environment:
+      - NANGO_SECRET_KEY=${NANGO_SECRET_KEY}
+      - NANGO_PUBLIC_KEY=${NANGO_PUBLIC_KEY}
+      - NANGO_CALLBACK_URL=${NANGO_CALLBACK_URL}
+      - NANGO_SERVER_URL=${NANGO_SERVER_URL}
+      - NANGO_DB_HOST=nango-db
+      - NANGO_DB_PORT=5432
+      - NANGO_DB_NAME=nango
+      - NANGO_DB_USER=nango
+      - NANGO_DB_PASSWORD=${NANGO_DB_PASSWORD:-nango}
+      - NANGO_DB_SSL=false
+    depends_on:
+      nango-db:
+        condition: service_healthy
+    networks:
+      - nanoclaw
+
+  nango-db:
+    image: postgres:15-alpine
+    container_name: nanoclaw-nango-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=nango
+      - POSTGRES_USER=nango
+      - POSTGRES_PASSWORD=${NANGO_DB_PASSWORD:-nango}
+    volumes:
+      - nango-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nango -d nango"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nanoclaw
+
+volumes:
+  nango-db-data:
+
+networks:
+  nanoclaw:
+    driver: bridge
