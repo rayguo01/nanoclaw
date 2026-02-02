@@ -10,14 +10,20 @@ export interface Message {
 }
 
 interface WebSocketMessage {
-  type: 'message' | 'typing' | 'status' | 'connected' | 'pong'
+  type: 'message' | 'typing' | 'status' | 'connected' | 'pong' | 'auth_required'
   data?: unknown
+}
+
+export interface AuthRequired {
+  provider: string
+  message: string
 }
 
 export function useWebSocket(isAuthenticated: boolean) {
   const [messages, setMessages] = useState<Message[]>([])
   const [isTyping, setIsTyping] = useState(false)
   const [isConnected, setIsConnected] = useState(false)
+  const [authRequired, setAuthRequired] = useState<AuthRequired | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectTimeoutRef = useRef<number | null>(null)
 
@@ -51,6 +57,9 @@ export function useWebSocket(isAuthenticated: boolean) {
             break
           case 'typing':
             setIsTyping((msg.data as { isTyping: boolean }).isTyping)
+            break
+          case 'auth_required':
+            setAuthRequired(msg.data as AuthRequired)
             break
           case 'connected':
             // Connection confirmed
@@ -142,10 +151,16 @@ export function useWebSocket(isAuthenticated: boolean) {
     }
   }
 
+  const clearAuthRequired = () => {
+    setAuthRequired(null)
+  }
+
   return {
     messages,
     isTyping,
     isConnected,
-    sendMessage
+    sendMessage,
+    authRequired,
+    clearAuthRequired
   }
 }

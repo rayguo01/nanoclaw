@@ -17,6 +17,7 @@ import {
 } from './config.js';
 import { RegisteredGroup } from './types.js';
 import { validateAdditionalMounts } from './mount-security.js';
+import * as nango from './nango-client.js';
 
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
@@ -52,6 +53,35 @@ function getHomeDir(): string {
   return home;
 }
 
+// OAuth providers that we sync tokens for
+const OAUTH_PROVIDERS = ['google-calendar'];
+
+/**
+ * Sync OAuth tokens from Nango to the tokens directory.
+ * This makes tokens available to agents in the container.
+ */
+async function syncOAuthTokens(): Promise<void> {
+  const tokensDir = path.join(DATA_DIR, 'tokens');
+  fs.mkdirSync(tokensDir, { recursive: true });
+
+  for (const provider of OAUTH_PROVIDERS) {
+    try {
+      const token = await nango.getToken(provider);
+      if (token) {
+        const tokenFile = path.join(tokensDir, `${provider}.json`);
+        fs.writeFileSync(tokenFile, JSON.stringify({
+          access_token: token.access_token,
+          refresh_token: token.refresh_token,
+          expires_at: token.expires_at
+        }, null, 2));
+        logger.debug({ provider }, 'OAuth token synced');
+      }
+    } catch (err) {
+      logger.debug({ err, provider }, 'Failed to sync OAuth token (may not be connected)');
+    }
+  }
+}
+
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -66,6 +96,10 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  authRequired?: {
+    provider: string;
+    scopes?: string[];
+  };
 }
 
 interface VolumeMount {
@@ -209,6 +243,9 @@ export async function runContainerAgent(
 
   const groupDir = path.join(GROUPS_DIR, group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
+
+  // Sync OAuth tokens from Nango before running container
+  await syncOAuthTokens();
 
   const mounts = buildVolumeMounts(group, input.isMain);
   const containerArgs = buildContainerArgs(mounts);
@@ -374,11 +411,35 @@ export async function runContainerAgent(
 
         const output: ContainerOutput = JSON.parse(jsonLine);
 
+        // Check for AUTH_REQUIRED in the result
+        // Format: AUTH_REQUIRED:provider:scope1,scope2
+        if (output.result && output.result.includes('AUTH_REQUIRED:')) {
+          const match = output.result.match(/AUTH_REQUIRED:([^:\s]+)(?::([^\s]+))?/);
+          if (match) {
+            const provider = match[1];
+            const scopes = match[2] ? match[2].split(',') : undefined;
+            output.authRequired = { provider, scopes };
+            logger.info({ provider, scopes }, 'Container requires OAuth authorization');
+          }
+        }
+
+        // Fallback: also check raw stdout for AUTH_REQUIRED (in case agent didn't echo it)
+        if (!output.authRequired && stdout.includes('AUTH_REQUIRED:')) {
+          const match = stdout.match(/AUTH_REQUIRED:([^:\s]+)(?::([^\s]+))?/);
+          if (match) {
+            const provider = match[1];
+            const scopes = match[2] ? match[2].split(',') : undefined;
+            output.authRequired = { provider, scopes };
+            logger.info({ provider, scopes }, 'Container requires OAuth authorization (detected in stdout)');
+          }
+        }
+
         logger.info({
           group: group.name,
           duration,
           status: output.status,
-          hasResult: !!output.result
+          hasResult: !!output.result,
+          authRequired: output.authRequired?.provider
         }, 'Container completed');
 
         resolve(output);

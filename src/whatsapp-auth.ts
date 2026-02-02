@@ -43,7 +43,11 @@ async function authenticate(): Promise<void> {
     },
     printQRInTerminal: false,
     logger,
-    browser: ['NanoClaw', 'Chrome', '1.0.0'],
+    browser: ['Ubuntu', 'Chrome', '127.0.0.0'],
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    connectTimeoutMs: 60000,
+    retryRequestDelayMs: 500,
   });
 
   sock.ev.on('connection.update', (update) => {
@@ -59,10 +63,15 @@ async function authenticate(): Promise<void> {
 
     if (connection === 'close') {
       const reason = (lastDisconnect?.error as any)?.output?.statusCode;
+      const errorCode = (lastDisconnect?.error as any)?.output?.payload?.attrs?.code;
 
       if (reason === DisconnectReason.loggedOut) {
         console.log('\n✗ Logged out. Delete store/auth and try again.');
         process.exit(1);
+      } else if (errorCode === '515' || reason === 515) {
+        console.log('\n⚠ WhatsApp 515 error - retrying in 5 seconds...');
+        console.log('  (This may be rate limiting, please wait)');
+        setTimeout(() => authenticate(), 5000);
       } else {
         console.log('\n✗ Connection failed. Please try again.');
         process.exit(1);

@@ -224,6 +224,7 @@ async function main(): Promise<void> {
 
   let result: string | null = null;
   let newSessionId: string | undefined;
+  let detectedAuthRequired: string | null = null;
 
   // Add context for scheduled tasks
   let prompt = input.prompt;
@@ -264,12 +265,31 @@ async function main(): Promise<void> {
       if ('result' in message && message.result) {
         result = message.result as string;
       }
+
+      // Detect AUTH_REQUIRED in tool results (bash command output)
+      // This catches cases where the script outputs AUTH_REQUIRED but Claude doesn't echo it
+      if (!detectedAuthRequired) {
+        const msgStr = JSON.stringify(message);
+        const authMatch = msgStr.match(/AUTH_REQUIRED:([^:\s"]+)(?::([^"\s]+))?/);
+        if (authMatch) {
+          detectedAuthRequired = `AUTH_REQUIRED:${authMatch[1]}${authMatch[2] ? ':' + authMatch[2] : ''}`;
+          log(`Detected AUTH_REQUIRED in tool output: ${detectedAuthRequired}`);
+        }
+      }
     }
 
     log('Agent completed successfully');
+
+    // If AUTH_REQUIRED was detected in tool output but not in result, prepend it
+    let finalResult = result;
+    if (detectedAuthRequired && (!result || !result.includes('AUTH_REQUIRED'))) {
+      log(`Injecting AUTH_REQUIRED into result: ${detectedAuthRequired}`);
+      finalResult = detectedAuthRequired + (result ? '\n\n' + result : '');
+    }
+
     writeOutput({
       status: 'success',
-      result,
+      result: finalResult,
       newSessionId
     });
 

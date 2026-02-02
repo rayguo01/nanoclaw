@@ -1,169 +1,215 @@
-import fs from 'fs';
-import path from 'path';
+/**
+ * Nango OAuth Client
+ *
+ * Interacts with self-hosted Nango server for OAuth token management.
+ */
+
 import pino from 'pino';
-import { DATA_DIR } from './config.js';
 
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
   transport: { target: 'pino-pretty', options: { colorize: true } }
 });
 
-const TOKENS_DIR = path.join(DATA_DIR, 'tokens');
+const NANGO_HOST = process.env.NANGO_HOST || 'http://localhost:3003';
+const NANGO_SERVER_URL = process.env.NANGO_SERVER_URL || NANGO_HOST; // Public-facing URL for OAuth
+const NANGO_SECRET_KEY = process.env.NANGO_SECRET_KEY || '';
+const NANGO_PUBLIC_KEY = process.env.NANGO_PUBLIC_KEY || '';
 
-// Token cache in memory
-const tokenCache: Record<string, { token: string; expiresAt: number }> = {};
+// Default user ID for single-user setup
+const DEFAULT_CONNECTION_ID = 'main';
 
-interface NangoTokenResponse {
+interface NangoToken {
   access_token: string;
-  expires_at?: string;
   refresh_token?: string;
+  expires_at?: string;
   raw?: Record<string, unknown>;
 }
 
-interface TokenData {
-  access_token: string;
-  refresh_token?: string;
-  expires_at?: string;
-  provider: string;
+interface NangoConnection {
+  id: number;
   connection_id: string;
+  provider_config_key: string;
+  created_at: string;
   updated_at: string;
 }
 
 /**
- * Get the Nango server URL from environment
+ * Check if a provider is configured in Nango
  */
-function getNangoServerUrl(): string {
-  return process.env.NANGO_SERVER_URL || 'http://localhost:3003';
-}
-
-/**
- * Get the Nango secret key from environment
- */
-function getNangoSecretKey(): string {
-  const key = process.env.NANGO_SECRET_KEY;
-  if (!key) {
-    throw new Error('NANGO_SECRET_KEY not set');
-  }
-  return key;
-}
-
-/**
- * Ensure tokens directory exists
- */
-function ensureTokensDir(): void {
-  fs.mkdirSync(TOKENS_DIR, { recursive: true });
-}
-
-/**
- * Get the token file path for a provider and connection
- */
-function getTokenPath(provider: string, connectionId?: string): string {
-  const filename = connectionId ? `${provider}-${connectionId}.json` : `${provider}.json`;
-  return path.join(TOKENS_DIR, filename);
-}
-
-/**
- * Load token from disk
- */
-function loadToken(provider: string, connectionId?: string): TokenData | null {
-  const tokenPath = getTokenPath(provider, connectionId);
+export async function isProviderConfigured(provider: string): Promise<boolean> {
   try {
-    if (fs.existsSync(tokenPath)) {
-      return JSON.parse(fs.readFileSync(tokenPath, 'utf-8'));
-    }
+    const response = await fetch(`${NANGO_HOST}/config/${provider}`, {
+      headers: {
+        'Authorization': `Bearer ${NANGO_SECRET_KEY}`,
+      },
+    });
+    return response.ok;
   } catch (err) {
-    logger.warn({ provider, connectionId, err }, 'Failed to load token from disk');
+    logger.error({ err, provider }, 'Failed to check provider configuration');
+    return false;
   }
-  return null;
 }
 
 /**
- * Save token to disk
+ * Check if user has an active connection for a provider
  */
-function saveToken(provider: string, connectionId: string, data: TokenData): void {
-  ensureTokensDir();
-  const tokenPath = getTokenPath(provider, connectionId);
-  fs.writeFileSync(tokenPath, JSON.stringify(data, null, 2));
-  logger.debug({ provider, connectionId }, 'Token saved to disk');
-}
-
-/**
- * Get a valid access token for a provider/connection.
- * Fetches from Nango if needed and caches locally.
- */
-export async function getToken(provider: string, connectionId: string): Promise<string | null> {
-  const cacheKey = `${provider}:${connectionId}`;
-
-  // Check memory cache first
-  const cached = tokenCache[cacheKey];
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.token;
-  }
-
-  // Check disk cache
-  const diskToken = loadToken(provider, connectionId);
-  if (diskToken) {
-    const expiresAt = diskToken.expires_at ? new Date(diskToken.expires_at).getTime() : 0;
-    if (expiresAt > Date.now()) {
-      tokenCache[cacheKey] = { token: diskToken.access_token, expiresAt };
-      return diskToken.access_token;
-    }
-  }
-
-  // Fetch from Nango
+export async function hasConnection(provider: string, connectionId: string = DEFAULT_CONNECTION_ID): Promise<boolean> {
   try {
-    const serverUrl = getNangoServerUrl();
-    const secretKey = getNangoSecretKey();
-
     const response = await fetch(
-      `${serverUrl}/connection/${connectionId}?provider_config_key=${provider}`,
+      `${NANGO_HOST}/connection/${connectionId}?provider_config_key=${provider}`,
       {
         headers: {
-          'Authorization': `Bearer ${secretKey}`
-        }
+          'Authorization': `Bearer ${NANGO_SECRET_KEY}`,
+        },
+      }
+    );
+    return response.ok;
+  } catch (err) {
+    logger.error({ err, provider, connectionId }, 'Failed to check connection');
+    return false;
+  }
+}
+
+/**
+ * Get OAuth token for a provider
+ */
+export async function getToken(provider: string, connectionId: string = DEFAULT_CONNECTION_ID): Promise<NangoToken | null> {
+  try {
+    const response = await fetch(
+      `${NANGO_HOST}/connection/${connectionId}?provider_config_key=${provider}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${NANGO_SECRET_KEY}`,
+        },
       }
     );
 
     if (!response.ok) {
       if (response.status === 404) {
-        logger.debug({ provider, connectionId }, 'No connection found in Nango');
+        logger.debug({ provider, connectionId }, 'No connection found');
         return null;
       }
-      throw new Error(`Nango API error: ${response.status} ${response.statusText}`);
+      throw new Error(`Failed to get token: ${response.status}`);
     }
 
-    const data = await response.json() as NangoTokenResponse;
-
-    if (!data.access_token) {
-      logger.warn({ provider, connectionId }, 'No access token in Nango response');
-      return null;
-    }
-
-    // Calculate expiry (default 1 hour if not specified)
-    const expiresAt = data.expires_at
-      ? new Date(data.expires_at).getTime()
-      : Date.now() + 3600 * 1000;
-
-    // Save to disk
-    const tokenData: TokenData = {
-      access_token: data.access_token,
-      refresh_token: data.refresh_token,
-      expires_at: new Date(expiresAt).toISOString(),
-      provider,
-      connection_id: connectionId,
-      updated_at: new Date().toISOString()
-    };
-    saveToken(provider, connectionId, tokenData);
-
-    // Update memory cache
-    tokenCache[cacheKey] = { token: data.access_token, expiresAt };
-
-    logger.info({ provider, connectionId }, 'Token fetched from Nango');
-    return data.access_token;
-
+    const data = await response.json() as { credentials: NangoToken };
+    return data.credentials;
   } catch (err) {
-    logger.error({ provider, connectionId, err }, 'Failed to fetch token from Nango');
+    logger.error({ err, provider, connectionId }, 'Failed to get token');
     return null;
+  }
+}
+
+/**
+ * Get OAuth authorization URL for connecting a provider
+ */
+export function getAuthUrl(provider: string, connectionId: string = DEFAULT_CONNECTION_ID, scopes?: string[]): string {
+  const params = new URLSearchParams({
+    connection_id: connectionId,
+    public_key: NANGO_PUBLIC_KEY,
+  });
+  // Add scopes if provided
+  if (scopes && scopes.length > 0) {
+    params.set('scopes', scopes.join(','));
+  }
+  // Use public-facing URL for OAuth (users visit this in browser)
+  return `${NANGO_SERVER_URL}/oauth/connect/${provider}?${params.toString()}`;
+}
+
+/**
+ * Delete a connection
+ */
+export async function deleteConnection(provider: string, connectionId: string = DEFAULT_CONNECTION_ID): Promise<boolean> {
+  try {
+    const response = await fetch(
+      `${NANGO_HOST}/connection/${connectionId}?provider_config_key=${provider}`,
+      {
+        method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${NANGO_SECRET_KEY}`,
+        },
+      }
+    );
+    return response.ok;
+  } catch (err) {
+    logger.error({ err, provider, connectionId }, 'Failed to delete connection');
+    return false;
+  }
+}
+
+/**
+ * List all connections for a user
+ */
+export async function listConnections(connectionId: string = DEFAULT_CONNECTION_ID): Promise<NangoConnection[]> {
+  try {
+    const response = await fetch(
+      `${NANGO_HOST}/connections?connection_id=${connectionId}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${NANGO_SECRET_KEY}`,
+        },
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`Failed to list connections: ${response.status}`);
+    }
+
+    const data = await response.json() as { connections: NangoConnection[] };
+    return data.connections || [];
+  } catch (err) {
+    logger.error({ err, connectionId }, 'Failed to list connections');
+    return [];
+  }
+}
+
+/**
+ * Get Nango public key for frontend
+ */
+export function getPublicKey(): string {
+  return NANGO_PUBLIC_KEY;
+}
+
+/**
+ * Get Nango host URL for frontend
+ */
+export function getNangoHost(): string {
+  // Return the public-facing URL for frontend
+  return process.env.NANGO_SERVER_URL || NANGO_HOST;
+}
+
+/**
+ * Sync token from Nango to local file for container access
+ */
+export async function syncTokenToFile(provider: string, connectionId: string = DEFAULT_CONNECTION_ID): Promise<boolean> {
+  try {
+    const token = await getToken(provider, connectionId);
+    if (!token) {
+      logger.warn({ provider, connectionId }, 'No token to sync');
+      return false;
+    }
+
+    // Write token to data/tokens directory
+    const tokensDir = process.env.TOKENS_DIR || './data/tokens';
+    const fs = await import('fs');
+    const path = await import('path');
+
+    fs.mkdirSync(tokensDir, { recursive: true });
+    const tokenFile = path.join(tokensDir, `${provider}.json`);
+
+    const tokenData = {
+      access_token: token.access_token,
+      refresh_token: token.refresh_token || null,
+      expires_at: token.expires_at || null,
+    };
+
+    fs.writeFileSync(tokenFile, JSON.stringify(tokenData, null, 2));
+    logger.info({ provider, tokenFile }, 'Token synced to file');
+    return true;
+  } catch (err) {
+    logger.error({ err, provider, connectionId }, 'Failed to sync token to file');
+    return false;
   }
 }
 
@@ -173,54 +219,63 @@ export async function getToken(provider: string, connectionId: string): Promise<
  */
 export async function initiateOAuth(
   provider: string,
-  connectionId: string,
+  connectionId: string = DEFAULT_CONNECTION_ID,
   scopes?: string[]
 ): Promise<string> {
-  const serverUrl = getNangoServerUrl();
-  const publicKey = process.env.NANGO_PUBLIC_KEY;
-
-  if (!publicKey) {
-    throw new Error('NANGO_PUBLIC_KEY not set');
+  // Check if provider is configured
+  const isConfigured = await isProviderConfigured(provider);
+  if (!isConfigured) {
+    throw new Error(`Provider ${provider} is not configured in Nango`);
   }
 
-  // Build the authorization URL
-  const params = new URLSearchParams({
-    public_key: publicKey,
-    connection_id: connectionId
-  });
+  // Default scopes for known providers
+  const defaultScopes: Record<string, string[]> = {
+    'google-calendar': [
+      'https://www.googleapis.com/auth/calendar',
+      'https://www.googleapis.com/auth/calendar.events'
+    ]
+  };
 
-  if (scopes && scopes.length > 0) {
-    params.set('scopes', scopes.join(','));
-  }
-
-  const authUrl = `${serverUrl}/oauth/connect/${provider}?${params.toString()}`;
-
-  logger.info({ provider, connectionId, scopes }, 'OAuth flow initiated');
-  return authUrl;
+  const finalScopes = scopes || defaultScopes[provider] || [];
+  return getAuthUrl(provider, connectionId, finalScopes);
 }
 
 /**
- * Check if a connection exists and is valid
+ * Create provider integration config in Nango
+ * This is needed before users can connect
  */
-export async function hasValidConnection(provider: string, connectionId: string): Promise<boolean> {
-  const token = await getToken(provider, connectionId);
-  return token !== null;
-}
-
-/**
- * Delete a connection (local cache only, doesn't affect Nango)
- */
-export function deleteLocalToken(provider: string, connectionId: string): void {
-  const cacheKey = `${provider}:${connectionId}`;
-  delete tokenCache[cacheKey];
-
-  const tokenPath = getTokenPath(provider, connectionId);
+export async function createProviderConfig(
+  provider: string,
+  clientId: string,
+  clientSecret: string,
+  scopes: string[]
+): Promise<boolean> {
   try {
-    if (fs.existsSync(tokenPath)) {
-      fs.unlinkSync(tokenPath);
-      logger.info({ provider, connectionId }, 'Local token deleted');
+    const response = await fetch(`${NANGO_HOST}/config`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${NANGO_SECRET_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        provider_config_key: provider,
+        provider: provider.replace('-', '_'), // google-calendar -> google_calendar
+        oauth_client_id: clientId,
+        oauth_client_secret: clientSecret,
+        oauth_scopes: scopes.join(' '),
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      logger.error({ provider, error }, 'Failed to create provider config');
+      return false;
     }
+
+    logger.info({ provider }, 'Provider config created');
+    return true;
   } catch (err) {
-    logger.warn({ provider, connectionId, err }, 'Failed to delete local token');
+    logger.error({ err, provider }, 'Failed to create provider config');
+    return false;
   }
 }

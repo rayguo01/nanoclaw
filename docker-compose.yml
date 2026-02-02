@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  nango:
+    image: nangohq/nango-server:latest
+    ports:
+      - "3003:3003"
+    environment:
+      - NANGO_SECRET_KEY=${NANGO_SECRET_KEY}
+      - NANGO_PUBLIC_KEY=${NANGO_PUBLIC_KEY}
+      - NANGO_CALLBACK_URL=${NANGO_CALLBACK_URL:-http://localhost:3003/oauth/callback}
+      - NANGO_DB_HOST=postgres
+      - NANGO_DB_PORT=5432
+      - NANGO_DB_NAME=nango
+      - NANGO_DB_USER=nango
+      - NANGO_DB_PASSWORD=nango
+      - NANGO_SERVER_URL=${NANGO_SERVER_URL:-http://localhost:3003}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15
+    environment:
+      - POSTGRES_DB=nango
+      - POSTGRES_USER=nango
+      - POSTGRES_PASSWORD=nango
+    volumes:
+      - nango_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nango -d nango"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  nango_data:

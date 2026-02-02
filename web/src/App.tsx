@@ -2,10 +2,11 @@ import { useAuth } from './hooks/useAuth'
 import { useWebSocket } from './hooks/useWebSocket'
 import { LoginForm } from './components/LoginForm'
 import { ChatContainer } from './components/ChatContainer'
+import { AuthModal } from './components/AuthModal'
 
 export default function App() {
   const { isAuthenticated, isLoading, error, login, logout } = useAuth()
-  const { messages, isTyping, isConnected, sendMessage } = useWebSocket(isAuthenticated)
+  const { messages, isTyping, isConnected, sendMessage, authRequired, clearAuthRequired } = useWebSocket(isAuthenticated)
 
   if (isLoading) {
     return (
@@ -20,13 +21,23 @@ export default function App() {
   }
 
   return (
-    <ChatContainer
-      messages={messages}
-      isTyping={isTyping}
-      isConnected={isConnected}
-      onSendMessage={sendMessage}
-      onLogout={logout}
-    />
+    <>
+      <ChatContainer
+        messages={messages}
+        isTyping={isTyping}
+        isConnected={isConnected}
+        onSendMessage={sendMessage}
+        onLogout={logout}
+      />
+      {authRequired && (
+        <AuthModal
+          provider={authRequired.provider}
+          message={authRequired.message}
+          onClose={clearAuthRequired}
+          onComplete={clearAuthRequired}
+        />
+      )}
+    </>
   )
 }
 

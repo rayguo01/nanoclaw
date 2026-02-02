@@ -9,6 +9,7 @@ import path from 'path';
 import fs from 'fs';
 import pino from 'pino';
 import { NewMessage } from './types.js';
+import * as nango from './nango-client.js';
 
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
@@ -54,7 +55,7 @@ export function setGetMessagesCallback(callback: GetMessagesCallback): void {
  * Broadcast a message to all connected WebSocket clients
  */
 export function broadcastMessage(message: {
-  type: 'message' | 'typing' | 'status';
+  type: 'message' | 'typing' | 'status' | 'auth_required';
   data: unknown;
 }): void {
   const payload = JSON.stringify(message);
@@ -77,6 +78,19 @@ export function broadcastNewMessage(msg: {
   source: 'whatsapp' | 'web';
 }): void {
   broadcastMessage({ type: 'message', data: msg });
+}
+
+/**
+ * Broadcast auth_required event when a skill needs OAuth
+ */
+export function broadcastAuthRequired(provider: string, message?: string): void {
+  broadcastMessage({
+    type: 'auth_required',
+    data: {
+      provider,
+      message: message || `需要授权 ${provider} 才能继续`,
+    }
+  });
 }
 
 export async function startWebServer(config: WebServerConfig): Promise<void> {
@@ -154,6 +168,99 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
     return { authenticated: true };
   });
 
+  // ===== OAuth Provider Routes =====
+
+  // Get Nango config for frontend
+  fastify.get('/api/auth/nango-config', { preHandler: verifyAuth }, async (request, reply) => {
+    return {
+      publicKey: nango.getPublicKey(),
+      host: nango.getNangoHost(),
+    };
+  });
+
+  // Check if a provider is connected
+  fastify.get('/api/auth/status/:provider', { preHandler: verifyAuth }, async (request, reply) => {
+    const { provider } = request.params as { provider: string };
+
+    const isConfigured = await nango.isProviderConfigured(provider);
+    if (!isConfigured) {
+      return { connected: false, configured: false };
+    }
+
+    const hasConn = await nango.hasConnection(provider);
+    return { connected: hasConn, configured: true };
+  });
+
+  // Get OAuth connection info for a provider
+  fastify.get('/api/auth/connect/:provider', { preHandler: verifyAuth }, async (request, reply) => {
+    const { provider } = request.params as { provider: string };
+
+    const isConfigured = await nango.isProviderConfigured(provider);
+    if (!isConfigured) {
+      return reply.status(400).send({
+        error: 'Provider not configured',
+        message: `${provider} is not configured in Nango. Please set up the provider first.`
+      });
+    }
+
+    // Default scopes for known providers
+    const defaultScopes: Record<string, string[]> = {
+      'google-calendar': [
+        'https://www.googleapis.com/auth/calendar',
+        'https://www.googleapis.com/auth/calendar.events'
+      ]
+    };
+    const scopes = defaultScopes[provider];
+
+    return {
+      authUrl: nango.getAuthUrl(provider, 'main', scopes),
+      provider,
+    };
+  });
+
+  // Notify that OAuth completed (called by frontend after popup closes)
+  fastify.post('/api/auth/complete', { preHandler: verifyAuth }, async (request, reply) => {
+    const { provider } = request.body as { provider: string };
+
+    if (!provider) {
+      return reply.status(400).send({ error: 'Provider is required' });
+    }
+
+    // Verify the connection was successful
+    const hasConn = await nango.hasConnection(provider);
+    if (!hasConn) {
+      return reply.status(400).send({
+        error: 'Connection not found',
+        message: 'OAuth flow may not have completed successfully'
+      });
+    }
+
+    // Sync token to file for container access
+    await nango.syncTokenToFile(provider);
+
+    logger.info({ provider }, 'OAuth connection completed');
+    return { success: true, provider };
+  });
+
+  // List all connected providers
+  fastify.get('/api/auth/connections', { preHandler: verifyAuth }, async (request, reply) => {
+    const connections = await nango.listConnections();
+    return { connections };
+  });
+
+  // Disconnect a provider
+  fastify.delete('/api/auth/disconnect/:provider', { preHandler: verifyAuth }, async (request, reply) => {
+    const { provider } = request.params as { provider: string };
+
+    const success = await nango.deleteConnection(provider);
+    if (!success) {
+      return reply.status(500).send({ error: 'Failed to disconnect provider' });
+    }
+
+    logger.info({ provider }, 'OAuth connection disconnected');
+    return { success: true };
+  });
+
   // ===== Messages Routes =====
 
   fastify.get('/api/messages', { preHandler: verifyAuth }, async (request, reply) => {
@@ -198,36 +305,12 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
       source: 'web'
     });
 
-    // Broadcast typing indicator
-    broadcastMessage({ type: 'typing', data: { isTyping: true } });
-
+    // Note: typing indicator and response broadcast are handled by the callback in index.ts
+    // to avoid duplicate broadcasts
     try {
       const response = await onWebMessage(message.trim(), 'web');
-
-      // Broadcast typing stopped
-      broadcastMessage({ type: 'typing', data: { isTyping: false } });
-
-      if (response) {
-        const responseId = `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        const responseTimestamp = new Date().toISOString();
-
-        // Broadcast the assistant response
-        broadcastNewMessage({
-          id: responseId,
-          sender: 'assistant',
-          sender_name: process.env.ASSISTANT_NAME || 'Andy',
-          content: response,
-          timestamp: responseTimestamp,
-          source: 'web'
-        });
-
-        return { success: true, response };
-      }
-
-      return { success: true, response: null };
+      return { success: true, response };
     } catch (err) {
-      // Broadcast typing stopped on error
-      broadcastMessage({ type: 'typing', data: { isTyping: false } });
       logger.error({ err }, 'Error processing web message');
       return reply.status(500).send({ error: 'Failed to process message' });
     }

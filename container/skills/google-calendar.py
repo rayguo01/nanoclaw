@@ -71,10 +71,13 @@ def load_credentials() -> Optional[Credentials]:
             return None
 
         # Convert expires_at to expiry if present
+        # Google's library uses naive UTC datetimes internally
         expiry = None
         if expires_at:
             try:
-                expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                # Parse ISO timestamp and convert to naive UTC
+                dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                expiry = dt.replace(tzinfo=None)  # Make naive (assumed UTC)
             except (ValueError, TypeError):
                 pass
 

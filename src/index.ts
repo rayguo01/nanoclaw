@@ -25,7 +25,7 @@ import { initDatabase, storeMessage, storeChatMetadata, getNewMessages, getMessa
 import { startSchedulerLoop } from './task-scheduler.js';
 import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot, AvailableGroup } from './container-runner.js';
 import { loadJson, saveJson } from './utils.js';
-import { startWebServer, setMessageCallback, setGetMessagesCallback, broadcastNewMessage, broadcastMessage } from './web-server.js';
+import { startWebServer, setMessageCallback, setGetMessagesCallback, broadcastNewMessage, broadcastMessage, broadcastAuthRequired } from './web-server.js';
 import { initiateOAuth } from './nango-client.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -254,14 +254,26 @@ async function runAgent(group: RegisteredGroup, prompt: string, chatJid: string)
     }
 
     // Handle AUTH_REQUIRED response from skills
-    if (output.result?.startsWith('AUTH_REQUIRED:')) {
-      const parts = output.result.split(':');
-      const provider = parts[1];
-      const scopes = parts[2]?.split(',') || [];
+    if (output.authRequired || output.result?.startsWith('AUTH_REQUIRED:')) {
+      let provider: string;
+      let scopes: string[] = [];
 
+      if (output.authRequired) {
+        provider = output.authRequired.provider;
+        scopes = output.authRequired.scopes || [];
+      } else {
+        const parts = output.result!.split(':');
+        provider = parts[1];
+        scopes = parts[2]?.split(',') || [];
+      }
+
+      // Broadcast to web clients (they'll show OAuth popup)
+      broadcastAuthRequired(provider, `需要授权 ${provider} 才能继续`);
+
+      // For WhatsApp, return URL-based auth link
       try {
         const authUrl = await initiateOAuth(provider, group.folder, scopes);
-        return `需要授权 ${provider}。请点击链接完成授权: ${authUrl}`;
+        return `需要授权 ${provider}。请在网页端完成授权，或点击链接: ${authUrl}`;
       } catch (err) {
         logger.error({ provider, err }, 'Failed to initiate OAuth');
         return `授权 ${provider} 失败，请稍后重试。`;
