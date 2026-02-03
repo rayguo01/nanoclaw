@@ -1,8 +1,46 @@
 # NanoClaw 开发概述
 
-## 当前版本: v1.2.1
+## 当前版本: v1.2.2
 
 ## 版本历史
+
+### v1.2.2 - 修复容器 OAuth 认证失败 (2026-02-03)
+
+修复 Agent 容器无法认证的问题，导致所有消息处理失败。
+
+#### 问题描述
+
+Agent 容器启动后 Claude Code 报错 "Invalid API key" 或 "OAuth token has expired"，导致无法回复消息。
+
+#### 根本原因
+
+1. **缺少 credentials 文件**：容器的 `.claude` 目录没有 `.credentials.json` 文件，Claude Code 无法认证
+2. **使用过期 token**：代码从 `.env` 读取 `CLAUDE_CODE_OAUTH_TOKEN`，但这个 token 会过期且不会自动更新
+
+#### 解决方案
+
+修改 `src/container-runner.ts` 的认证逻辑：
+
+1. **同步 credentials 文件**：每次运行容器前，从 `~/.claude/.credentials.json` 复制到容器的 `.claude` 目录
+2. **自动获取最新 token**：不再从 `.env` 读取 token，而是从 `~/.claude/.credentials.json` 读取（Claude Code 会自动刷新这个文件）
+
+#### 修改文件
+
+| 文件 | 修改内容 |
+|------|----------|
+| `src/container-runner.ts` | 添加 credentials 同步和自动 token 刷新逻辑 |
+
+#### 认证流程（修改后）
+
+```
+运行容器前
+├── 从 ~/.claude/.credentials.json 读取最新 OAuth token
+├── 写入 data/env/env (供容器 entrypoint 使用)
+├── 复制 .credentials.json 到容器 .claude 目录
+└── 启动容器
+```
+
+---
 
 ### v1.2.1 - OAuth Token 同步优化 (2026-02-02)
 

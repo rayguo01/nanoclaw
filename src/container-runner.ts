@@ -151,6 +151,20 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
   // Each group gets their own .claude/ to prevent cross-group session access
   const groupSessionsDir = path.join(DATA_DIR, 'sessions', group.folder, '.claude');
   fs.mkdirSync(groupSessionsDir, { recursive: true });
+
+  // Sync credentials from host's Claude Code config
+  // Claude Code requires .credentials.json for OAuth authentication
+  const hostCredentials = path.join(homeDir, '.claude', '.credentials.json');
+  const containerCredentials = path.join(groupSessionsDir, '.credentials.json');
+  if (fs.existsSync(hostCredentials)) {
+    try {
+      fs.copyFileSync(hostCredentials, containerCredentials);
+      logger.debug({ group: group.name }, 'Synced Claude credentials to container');
+    } catch (err) {
+      logger.warn({ err, group: group.name }, 'Failed to sync Claude credentials');
+    }
+  }
+
   mounts.push({
     hostPath: groupSessionsDir,
     containerPath: '/home/node/.claude',
@@ -169,29 +183,50 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
   });
 
   // Environment file directory (workaround for Apple Container -i env var bug)
-  // Only expose specific auth variables needed by Claude Code, not the entire .env
+  // Authentication priority:
+  // 1. OAuth token from ~/.claude/.credentials.json (auto-refreshed by Claude Code)
+  // 2. ANTHROPIC_API_KEY from .env (manual API key)
+  // Note: We no longer read CLAUDE_CODE_OAUTH_TOKEN from .env since it gets stale.
+  // The .credentials.json sync above handles OAuth authentication.
   const envDir = path.join(DATA_DIR, 'env');
   fs.mkdirSync(envDir, { recursive: true });
   const envFile = path.join(projectRoot, '.env');
+  const envLines: string[] = [];
+
+  // Try to get fresh OAuth token from credentials file
+  const credentialsFile = path.join(homeDir, '.claude', '.credentials.json');
+  if (fs.existsSync(credentialsFile)) {
+    try {
+      const creds = JSON.parse(fs.readFileSync(credentialsFile, 'utf-8'));
+      const token = creds?.claudeAiOauth?.accessToken;
+      if (token) {
+        envLines.push(`CLAUDE_CODE_OAUTH_TOKEN=${token}`);
+        logger.debug({ group: group.name }, 'Using OAuth token from credentials file');
+      }
+    } catch (err) {
+      logger.warn({ err, group: group.name }, 'Failed to read OAuth token from credentials');
+    }
+  }
+
+  // Also check for ANTHROPIC_API_KEY in .env (alternative auth method)
   if (fs.existsSync(envFile)) {
     const envContent = fs.readFileSync(envFile, 'utf-8');
-    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
-    const filteredLines = envContent
-      .split('\n')
-      .filter(line => {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) return false;
-        return allowedVars.some(v => trimmed.startsWith(`${v}=`));
-      });
-
-    if (filteredLines.length > 0) {
-      fs.writeFileSync(path.join(envDir, 'env'), filteredLines.join('\n') + '\n');
-      mounts.push({
-        hostPath: envDir,
-        containerPath: '/workspace/env-dir',
-        readonly: true
-      });
+    for (const line of envContent.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('ANTHROPIC_API_KEY=')) {
+        envLines.push(trimmed);
+        break;
+      }
     }
+  }
+
+  if (envLines.length > 0) {
+    fs.writeFileSync(path.join(envDir, 'env'), envLines.join('\n') + '\n');
+    mounts.push({
+      hostPath: envDir,
+      containerPath: '/workspace/env-dir',
+      readonly: true
+    });
   }
 
   // OAuth tokens directory (read-only for all groups)
